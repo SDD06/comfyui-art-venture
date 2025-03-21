@@ -1,7 +1,7 @@
 import cv2
 import torch
 import numpy as np
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageFilter
 from typing import Dict
 
 from .sam.nodes import SAMLoader, GetSAMEmbedding, SAMEmbeddingToImage
@@ -22,6 +22,9 @@ class PrepareImageAndMaskForInpaint:
                 "mask_blur": ("INT", {"default": 4, "min": 0, "max": 64}),
                 "inpaint_masked": ("BOOLEAN", {"default": False}),
                 "mask_padding": ("INT", {"default": 32, "min": 0, "max": 256}),
+                "tight_focus": ("BOOLEAN", {"default": False}),
+                "focus_padding": ("INT", {"default": 16, "min": 0, "max": 128}),
+                "target_size": ("INT", {"default": 512, "min": 64, "max": 2048}),
                 "width": ("INT", {"default": 0, "min": 0, "max": 2048}),
                 "height": ("INT", {"default": 0, "min": 0, "max": 2048}),
             }
@@ -36,10 +39,12 @@ class PrepareImageAndMaskForInpaint:
         self,
         image: torch.Tensor,
         mask: torch.Tensor,
-        # resize_mode: str,
         mask_blur: int,
         inpaint_masked: bool,
         mask_padding: int,
+        tight_focus: bool,
+        focus_padding: int,
+        target_size: int,
         width: int,
         height: int,
     ):
@@ -75,17 +80,64 @@ class PrepareImageAndMaskForInpaint:
             crop_region = None
 
             if inpaint_masked:
+                # Get initial crop region
                 crop_region = get_crop_region(np_mask, mask_padding)
-                crop_region = expand_crop_region(crop_region, width, height, sourcewidth, sourceheight)
-                # Store individual coordinates
+                
+                # Extract crop dimensions
                 left, top, right, bottom = crop_region
+                
+                if tight_focus:
+                    # Find the tightest bounding box around the mask
+                    # Get mask pixels
+                    mask_indices = np.where(np_mask > 0.05)
+                    
+                    if len(mask_indices[0]) > 0:
+                        # Use actual mask pixels to determine boundaries
+                        min_y, max_y = np.min(mask_indices[0]), np.max(mask_indices[0])
+                        min_x, max_x = np.min(mask_indices[1]), np.max(mask_indices[1])
+                        
+                        # Add minimal padding
+                        left = max(0, min_x - focus_padding)
+                        top = max(0, min_y - focus_padding)
+                        right = min(sourcewidth, max_x + focus_padding)
+                        bottom = min(sourceheight, max_y + focus_padding)
+                        
+                        # Update crop region with tight focus
+                        crop_region = (left, top, right, bottom)
+                
+                # Get output dimensions for resizing
+                crop_width = right - left
+                crop_height = bottom - top
+                
+                # Ensure valid crop dimensions
+                if crop_width <= 0 or crop_height <= 0:
+                    # Fallback to standard crop
+                    crop_region = get_crop_region(np_mask, mask_padding)
+                    left, top, right, bottom = crop_region
+                    crop_width = right - left
+                    crop_height = bottom - top
+                
+                # Calculate target dimensions to maintain aspect ratio
+                aspect_ratio = crop_width / crop_height
+                
+                if aspect_ratio >= 1.0:
+                    # Landscape or square
+                    target_w = target_size
+                    target_h = int(target_size / aspect_ratio)
+                else:
+                    # Portrait
+                    target_h = target_size
+                    target_w = int(target_size * aspect_ratio)
+                
+                # Store individual coordinates
                 lefts.append(torch.tensor(left, dtype=torch.int64))
                 tops.append(torch.tensor(top, dtype=torch.int64))
                 rights.append(torch.tensor(right, dtype=torch.int64))
                 bottoms.append(torch.tensor(bottom, dtype=torch.int64))
-                # crop mask
+                
+                # Crop mask
                 overlay_mask = pil_mask
-                pil_mask = resize_image(pil_mask.crop(crop_region), width, height, ResizeMode.RESIZE_TO_FIT)
+                pil_mask = resize_image(pil_mask.crop(crop_region), target_w, target_h, ResizeMode.RESIZE_TO_FIT)
                 pil_mask = pil_mask.convert("L")
             else:
                 np_mask = np.clip((np_mask.astype(np.float32)) * 2, 0, 255).astype(np.uint8)
@@ -104,8 +156,17 @@ class PrepareImageAndMaskForInpaint:
             overlay_images.append(pil2tensor(image_masked.convert("RGBA")))
             overlay_masks.append(pil2tensor(overlay_mask))
 
-            if crop_region is not None:
-                pil_img = resize_image(pil_img.crop(crop_region), width, height, ResizeMode.RESIZE_TO_FIT)
+            if crop_region is not None and crop_region != (0, 0, 0, 0):
+                # When tight focus is enabled, use the natural aspect ratio of the mask
+                if tight_focus:
+                    # Use the dimensions we calculated earlier
+                    resize_width, resize_height = target_w, target_h
+                else:
+                    # Use specified width/height
+                    resize_width = width if width > 0 else right - left
+                    resize_height = height if height > 0 else bottom - top
+                
+                pil_img = resize_image(pil_img.crop(crop_region), resize_width, resize_height, ResizeMode.RESIZE_TO_FIT)
             else:
                 crop_region = (0, 0, 0, 0)
 
@@ -218,151 +279,129 @@ class CreateExpandedCanvasForOutpaint:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE",),
+                "original_image": ("IMAGE",),
+                "focused_image": ("IMAGE",),
                 "left": ("INT", {"default": 0, "min": 0, "max": 4096}),
                 "top": ("INT", {"default": 0, "min": 0, "max": 4096}),
                 "right": ("INT", {"default": 0, "min": 0, "max": 4096}),
                 "bottom": ("INT", {"default": 0, "min": 0, "max": 4096}),
-                "expansion_direction": (["left", "right", "top", "bottom", "all", "custom"], {"default": "all"}),
-                "custom_width": ("INT", {"default": 0, "min": 0, "max": 4096}),
-                "custom_height": ("INT", {"default": 0, "min": 0, "max": 4096}),
-                "expansion_factor": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 5.0, "step": 0.1}),
+                "focus_mode": (["only_focused", "mask_outside_focus", "mask_both"], {"default": "mask_outside_focus"}),
+                "feather_edges": ("INT", {"default": 10, "min": 0, "max": 100}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("expanded_image", "outpaint_mask", "new_left", "new_top", "new_right", "new_bottom")
+    RETURN_TYPES = ("IMAGE", "MASK", "CROP_REGION")
+    RETURN_NAMES = ("expanded_image", "outpaint_mask", "new_crop_region")
     CATEGORY = "Art Venture/Inpainting"
-    FUNCTION = "expand_canvas"
+    FUNCTION = "create_outpaint_canvas"
 
-    def expand_canvas(self, image, left, top, right, bottom, 
-                     expansion_direction, custom_width, custom_height, expansion_factor):
+    def create_outpaint_canvas(self, original_image, focused_image, left, top, right, bottom, focus_mode, feather_edges):
         images = []
         masks = []
-        new_lefts = []
-        new_tops = []
-        new_rights = []
-        new_bottoms = []
+        crop_regions = []
         
-        for img in image:
-            pil_img = tensor2pil(img.unsqueeze(0))
-            orig_width, orig_height = pil_img.size
+        for orig_img, focus_img in zip(original_image, focused_image):
+            # Convert tensors to PIL images
+            orig_pil = tensor2pil(orig_img.unsqueeze(0))
+            focus_pil = tensor2pil(focus_img.unsqueeze(0))
             
-            # Original crop width and height
+            # Get image dimensions
+            orig_width, orig_height = orig_pil.size
+            focus_width, focus_height = focus_pil.size
+            
+            # Validate crop coordinates
+            left = max(0, min(left, orig_width-1))
+            top = max(0, min(top, orig_height-1))
+            right = max(left+1, min(right, orig_width))
+            bottom = max(top+1, min(bottom, orig_height))
+            
+            # Resize focused image to match crop dimensions
             crop_width = right - left
             crop_height = bottom - top
+            focus_pil = resize_image(focus_pil, crop_width, crop_height, ResizeMode.RESIZE_TO_FILL)
             
-            # Calculate expansion sizes based on direction
-            if expansion_direction == "custom":
-                new_width = custom_width if custom_width > 0 else orig_width
-                new_height = custom_height if custom_height > 0 else orig_height
-            else:
-                # Default expansion based on factor
-                if expansion_direction in ["left", "right", "all"]:
-                    width_expansion = int(crop_width * (expansion_factor - 1))
-                    new_width = orig_width + width_expansion
-                else:
-                    new_width = orig_width
+            # Convert to RGBA for compositing
+            orig_rgba = orig_pil.convert("RGBA")
+            focus_rgba = focus_pil.convert("RGBA")
+            
+            # Create the output mask based on focus_mode
+            if focus_mode == "only_focused":
+                # Only include the focused region in the result
+                # Create RGBA image with focused region
+                result = Image.new("RGBA", (orig_width, orig_height), (0, 0, 0, 0))
+                result.paste(focus_rgba, (left, top))
+                
+                # Create mask where focused area is black (0) and rest is white (255)
+                mask = Image.new("L", (orig_width, orig_height), 255)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.rectangle((left, top, right, bottom), fill=0)
+            
+            elif focus_mode == "mask_outside_focus":
+                # Include both original and focused region, but mask outside focus
+                # Start with original image
+                result = orig_rgba.copy()
+                
+                # Paste focused region on top
+                result.paste(focus_rgba, (left, top))
+                
+                # Create mask where focused area is black (0) and rest is white (255)
+                mask = Image.new("L", (orig_width, orig_height), 255)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.rectangle((left, top, right, bottom), fill=0)
+            
+            else:  # "mask_both"
+                # Include original but prepare masks for both inside and outside focus
+                # Start with original image
+                result = orig_rgba.copy()
+                
+                # Paste focused region (for reference, will be masked anyway)
+                result.paste(focus_rgba, (left, top))
+                
+                # Create mask where both focused and outside areas are marked for outpainting
+                # This is a special mask where:
+                # - Focused region is gray (128) - will be outpainted differently
+                # - Rest is white (255) - will be outpainted normally
+                mask = Image.new("L", (orig_width, orig_height), 255)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.rectangle((left, top, right, bottom), fill=128)
+            
+            # Apply feathering to the mask edges if requested
+            if feather_edges > 0 and focus_mode != "mask_both":
+                # Create a feathered mask by blurring
+                feathered_mask = mask.copy()
+                feathered_mask = feathered_mask.filter(ImageFilter.GaussianBlur(radius=feather_edges))
+                
+                # For "only_focused" we need to invert the feathering effect
+                if focus_mode == "only_focused":
+                    # Create an inverted mask for the alpha channel
+                    alpha_mask = Image.new("L", (orig_width, orig_height), 0)
+                    alpha_draw = ImageDraw.Draw(alpha_mask)
+                    alpha_draw.rectangle((left, top, right, bottom), fill=255)
+                    alpha_mask = alpha_mask.filter(ImageFilter.GaussianBlur(radius=feather_edges))
                     
-                if expansion_direction in ["top", "bottom", "all"]:
-                    height_expansion = int(crop_height * (expansion_factor - 1))
-                    new_height = orig_height + height_expansion
+                    # Apply the alpha mask to result
+                    result.putalpha(alpha_mask)
                 else:
-                    new_height = orig_height
+                    # Normal feathering for "mask_outside_focus"
+                    mask = feathered_mask
             
-            # Create new image with transparency
-            new_img = Image.new("RGBA", (new_width, new_height), (0, 0, 0, 0))
-            
-            # Calculate paste position
-            if expansion_direction == "left":
-                paste_x = new_width - orig_width
-                paste_y = 0
-            elif expansion_direction == "top":
-                paste_x = 0
-                paste_y = new_height - orig_height
-            elif expansion_direction == "right":
-                paste_x = 0
-                paste_y = 0
-            elif expansion_direction == "bottom":
-                paste_x = 0
-                paste_y = 0
-            elif expansion_direction == "all":
-                paste_x = width_expansion // 2
-                paste_y = height_expansion // 2
-            else:  # custom
-                paste_x = (new_width - orig_width) // 2
-                paste_y = (new_height - orig_height) // 2
-            
-            # Paste original image
-            new_img.paste(pil_img.convert("RGBA"), (paste_x, paste_y))
-            
-            # Create mask for outpainting (255 for areas to outpaint, 0 for original image)
-            mask = Image.new("L", (new_width, new_height), 255)
-            mask_draw = ImageDraw.Draw(mask)
-            mask_draw.rectangle((paste_x, paste_y, paste_x + orig_width, paste_y + orig_height), fill=0)
-            
-            # Calculate new coordinates for the region to outpaint
-            if expansion_direction == "left":
-                new_left = 0
-                new_top = top
-                new_right = paste_x
-                new_bottom = bottom
-            elif expansion_direction == "top":
-                new_left = left
-                new_top = 0
-                new_right = right
-                new_bottom = paste_y
-            elif expansion_direction == "right":
-                new_left = paste_x + orig_width
-                new_top = top
-                new_right = new_width
-                new_bottom = bottom
-            elif expansion_direction == "bottom":
-                new_left = left
-                new_top = paste_y + orig_height
-                new_right = right
-                new_bottom = new_height
-            elif expansion_direction == "all":
-                # Adjust original crop region to new position
-                new_left = left + paste_x
-                new_top = top + paste_y
-                new_right = right + paste_x
-                new_bottom = bottom + paste_y
-            else:  # custom
-                new_left = left + paste_x
-                new_top = top + paste_y
-                new_right = right + paste_x
-                new_bottom = bottom + paste_y
-            
-            # Convert back to tensor - MODIFY THIS PART
-            # Before:
-            # new_img_tensor = pil2tensor(new_img)
-            
-            # After - Convert RGBA to RGB before creating tensor:
-            if new_img.mode == "RGBA":
+            # Convert back to RGB
+            if result.mode == "RGBA":
                 # Create white background
-                bg = Image.new("RGB", new_img.size, (255, 255, 255))
-                # Composite the image with alpha on the background
-                bg.paste(new_img, mask=new_img.split()[3])  # Use alpha channel as mask
-                new_img = bg
+                bg = Image.new("RGB", result.size, (255, 255, 255))
+                # Composite with alpha
+                bg.paste(result, mask=result.split()[3])
+                result = bg
             
-            new_img_tensor = pil2tensor(new_img)
-            mask_tensor = pil2tensor(mask)
-            
-            images.append(new_img_tensor)
-            masks.append(mask_tensor)
-            new_lefts.append(torch.tensor(new_left, dtype=torch.int64))
-            new_tops.append(torch.tensor(new_top, dtype=torch.int64))
-            new_rights.append(torch.tensor(new_right, dtype=torch.int64))
-            new_bottoms.append(torch.tensor(new_bottom, dtype=torch.int64))
+            # Append results
+            images.append(pil2tensor(result))
+            masks.append(pil2tensor(mask))
+            crop_regions.append(torch.tensor((left, top, right, bottom), dtype=torch.int64))
         
         return (
             torch.cat(images, dim=0),
             torch.cat(masks, dim=0),
-            torch.stack(new_lefts),
-            torch.stack(new_tops),
-            torch.stack(new_rights),
-            torch.stack(new_bottoms),
+            torch.stack(crop_regions),
         )
 
 
